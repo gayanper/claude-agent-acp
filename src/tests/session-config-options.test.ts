@@ -60,6 +60,38 @@ const MOCK_CONFIG_OPTIONS = [
   },
 ];
 
+const MOCK_EFFORT_OPTION = {
+  id: "effort",
+  name: "Thinking",
+  type: "select",
+  category: "thought_level",
+  currentValue: "high",
+  options: [
+    { value: "low", name: "Low", description: "Minimal thinking, fastest responses" },
+    { value: "medium", name: "Medium", description: "Moderate thinking" },
+    { value: "high", name: "High", description: "Deep reasoning (default)" },
+    { value: "max", name: "Max", description: "Maximum effort" },
+  ],
+};
+
+const MOCK_CONFIG_OPTIONS_WITH_EFFORT = [...MOCK_CONFIG_OPTIONS, MOCK_EFFORT_OPTION];
+
+const MOCK_AVAILABLE_MODEL_INFO = [
+  {
+    value: "claude-opus-4-5",
+    displayName: "Claude Opus",
+    description: "Most capable",
+    supportsEffort: true,
+    supportedEffortLevels: ["low", "medium", "high", "max"],
+  },
+  {
+    value: "claude-sonnet-4-5",
+    displayName: "Claude Sonnet",
+    description: "Balanced",
+    supportsEffort: false,
+  },
+];
+
 describe("session config options", () => {
   let agent: ClaudeAcpAgentType;
   let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
@@ -92,8 +124,30 @@ describe("session config options", () => {
       input: null,
       cancelled: false,
       permissionMode: "default",
+      effort: undefined,
+      availableModelInfo: [],
       settingsManager: {},
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
+    };
+  }
+
+  function populateSessionWithEffort() {
+    setPermissionModeSpy = vi.fn();
+    setModelSpy = vi.fn();
+
+    (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
+      query: {
+        setPermissionMode: setPermissionModeSpy,
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      },
+      input: null,
+      cancelled: false,
+      permissionMode: "default",
+      effort: undefined,
+      availableModelInfo: MOCK_AVAILABLE_MODEL_INFO,
+      settingsManager: {},
+      configOptions: structuredClone(MOCK_CONFIG_OPTIONS_WITH_EFFORT),
     };
   }
 
@@ -413,6 +467,123 @@ describe("session config options", () => {
       expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
         "claude-sonnet-4-5",
       );
+    });
+  });
+
+  describe("thought_level (effort) config option", () => {
+    beforeEach(() => {
+      populateSessionWithEffort();
+    });
+
+    it("effort option is present with category thought_level", async () => {
+      const session = (
+        agent as unknown as { sessions: Record<string, { configOptions: unknown[] }> }
+      ).sessions[SESSION_ID];
+      const effortOption = session.configOptions.find((o: any) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect((effortOption as any).category).toBe("thought_level");
+    });
+
+    it("effort option has correct default value", async () => {
+      const session = (
+        agent as unknown as { sessions: Record<string, { configOptions: unknown[] }> }
+      ).sessions[SESSION_ID];
+      const effortOption = session.configOptions.find((o: any) => o.id === "effort") as any;
+      expect(effortOption?.currentValue).toBe("high");
+    });
+
+    it("effort option exposes all supported levels", async () => {
+      const session = (
+        agent as unknown as { sessions: Record<string, { configOptions: unknown[] }> }
+      ).sessions[SESSION_ID];
+      const effortOption = session.configOptions.find((o: any) => o.id === "effort") as any;
+      const values = effortOption?.options.map((o: any) => o.value);
+      expect(values).toEqual(["low", "medium", "high", "max"]);
+    });
+
+    it("setSessionConfigOption for effort stores the value in session.effort", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      const session = (
+        agent as unknown as { sessions: Record<string, { effort: string }> }
+      ).sessions[SESSION_ID];
+      expect(session.effort).toBe("low");
+    });
+
+    it("setSessionConfigOption for effort updates configOptions currentValue", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "medium",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort") as any;
+      expect(effortOption?.currentValue).toBe("medium");
+    });
+
+    it("invalid effort value throws", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "effort",
+          value: "extreme",
+        }),
+      ).rejects.toThrow("Invalid value for config option effort: extreme");
+    });
+
+    it("returns full configOptions including effort when effort is set", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "max",
+      });
+
+      expect(response.configOptions.find((o) => o.id === "mode")).toBeDefined();
+      expect(response.configOptions.find((o) => o.id === "model")).toBeDefined();
+      expect(response.configOptions.find((o) => o.id === "effort")).toBeDefined();
+    });
+  });
+
+  describe("model change updates effort config option", () => {
+    beforeEach(() => {
+      populateSessionWithEffort();
+    });
+
+    it("removes effort option when switching to a model that does not support effort", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-5",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeUndefined();
+    });
+
+    it("retains effort option when switching to a model that supports effort", async () => {
+      // Start on sonnet (no effort), switch back to opus (supports effort)
+      const session = (
+        agent as unknown as { sessions: Record<string, { configOptions: unknown[]; availableModelInfo: unknown[] }> }
+      ).sessions[SESSION_ID];
+      // Temporarily set model to sonnet so we can switch back
+      session.configOptions = session.configOptions.map((o: any) =>
+        o.id === "model" ? { ...o, currentValue: "claude-sonnet-4-5" } : o,
+      );
+      session.configOptions = session.configOptions.filter((o: any) => o.id !== "effort");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect((effortOption as any).category).toBe("thought_level");
     });
   });
 });

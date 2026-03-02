@@ -182,4 +182,29 @@ describe("createSession options merging", () => {
     // ACP-provided MCP server should also be present
     expect(capturedOptions!.mcpServers).toHaveProperty("acp-server");
   });
+
+  it("passes user-provided effort option to query Options", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            effort: "low",
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.effort).toBe("low");
+  });
+
+  it("does not set effort in Options when not provided", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.effort).toBeUndefined();
+  });
 });

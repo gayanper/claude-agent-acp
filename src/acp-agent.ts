@@ -141,11 +141,15 @@ type AccumulatedUsage = {
   cachedWriteTokens: number;
 };
 
+type EffortLevel = "low" | "medium" | "high" | "max";
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   permissionMode: PermissionMode;
+  effort?: EffortLevel;
+  availableModelInfo: ModelInfo[];
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
   configOptions: SessionConfigOption[];
@@ -743,6 +747,15 @@ export class ClaudeAcpAgent implements Agent {
     }
     await this.sessions[params.sessionId].query.setModel(params.modelId);
     await this.updateConfigOption(params.sessionId, "model", params.modelId);
+    const session = this.sessions[params.sessionId];
+    session.configOptions = this.syncEffortConfigOption(params.sessionId, params.modelId, session.configOptions);
+    await this.client.sessionUpdate({
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -788,11 +801,17 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await this.sessions[params.sessionId].query.setModel(params.value);
+    } else if (params.configId === "effort") {
+      session.effort = params.value as EffortLevel;
     }
 
     session.configOptions = session.configOptions.map((o) =>
       o.id === params.configId ? { ...o, currentValue: params.value } : o,
     );
+
+    if (params.configId === "model") {
+      session.configOptions = this.syncEffortConfigOption(params.sessionId, params.value, session.configOptions);
+    }
 
     return { configOptions: session.configOptions };
   }
@@ -1022,6 +1041,50 @@ export class ClaudeAcpAgent implements Agent {
     });
   }
 
+  /**
+   * Updates the effort config option when the model changes.
+   * Adds the effort option if the new model supports it, removes it if not.
+   */
+  private syncEffortConfigOption(
+    sessionId: string,
+    newModelId: string,
+    configOptions: SessionConfigOption[],
+  ): SessionConfigOption[] {
+    const session = this.sessions[sessionId];
+    if (!session) return configOptions;
+
+    const effortInfo = getEffortInfo(newModelId, session.effort, session.availableModelInfo);
+
+    // Remove any existing effort option
+    const withoutEffort = configOptions.filter((o) => o.id !== "effort");
+
+    if (!effortInfo) return withoutEffort;
+
+    const EFFORT_LABELS: Record<EffortLevel, { name: string; description: string }> = {
+      low: { name: "Low", description: "Minimal thinking, fastest responses" },
+      medium: { name: "Medium", description: "Moderate thinking" },
+      high: { name: "High", description: "Deep reasoning (default)" },
+      max: { name: "Max", description: "Maximum effort" },
+    };
+
+    return [
+      ...withoutEffort,
+      {
+        id: "effort",
+        name: "Thinking",
+        description: "Controls how much Claude reasons before responding",
+        category: "thought_level",
+        type: "select",
+        currentValue: effortInfo.currentEffort,
+        options: effortInfo.levels.map((level) => ({
+          value: level,
+          name: EFFORT_LABELS[level]?.name ?? level,
+          description: EFFORT_LABELS[level]?.description,
+        })),
+      },
+    ];
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
@@ -1195,6 +1258,8 @@ export class ClaudeAcpAgent implements Agent {
       input: input,
       cancelled: false,
       permissionMode,
+      effort: userProvidedOptions?.effort as EffortLevel | undefined,
+      availableModelInfo: [],
       settingsManager,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1211,6 +1276,9 @@ export class ClaudeAcpAgent implements Agent {
     const initializationResult = await q.initializationResult();
 
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
+
+    // Store raw model info for use when model changes
+    this.sessions[sessionId].availableModelInfo = initializationResult.models;
 
     const availableModes = [
       {
@@ -1248,7 +1316,12 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
+    const effortInfo = getEffortInfo(
+      models.currentModelId,
+      this.sessions[sessionId].effort,
+      initializationResult.models,
+    );
+    const configOptions = buildConfigOptions(modes, models, effortInfo);
     this.sessions[sessionId].configOptions = configOptions;
 
     return {
@@ -1260,11 +1333,31 @@ export class ClaudeAcpAgent implements Agent {
   }
 }
 
+function getEffortInfo(
+  currentModelId: string,
+  currentEffort: EffortLevel | undefined,
+  availableModels: ModelInfo[],
+): { currentEffort: EffortLevel; levels: EffortLevel[] } | null {
+  const modelInfo = availableModels.find((m) => m.value === currentModelId);
+  if (!modelInfo?.supportsEffort || !modelInfo.supportedEffortLevels?.length) return null;
+  const levels = modelInfo.supportedEffortLevels as EffortLevel[];
+  const resolvedEffort = currentEffort ?? (levels.includes("high") ? "high" : levels[0]);
+  return { currentEffort: resolvedEffort, levels };
+}
+
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  effortInfo: { currentEffort: EffortLevel; levels: EffortLevel[] } | null,
 ): SessionConfigOption[] {
-  return [
+  const EFFORT_LABELS: Record<EffortLevel, { name: string; description: string }> = {
+    low: { name: "Low", description: "Minimal thinking, fastest responses" },
+    medium: { name: "Medium", description: "Moderate thinking" },
+    high: { name: "High", description: "Deep reasoning (default)" },
+    max: { name: "Max", description: "Maximum effort" },
+  };
+
+  const options: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -1292,6 +1385,24 @@ function buildConfigOptions(
       })),
     },
   ];
+
+  if (effortInfo) {
+    options.push({
+      id: "effort",
+      name: "Thinking",
+      description: "Controls how much Claude reasons before responding",
+      category: "thought_level",
+      type: "select",
+      currentValue: effortInfo.currentEffort,
+      options: effortInfo.levels.map((level) => ({
+        value: level,
+        name: EFFORT_LABELS[level]?.name ?? level,
+        description: EFFORT_LABELS[level]?.description,
+      })),
+    });
+  }
+
+  return options;
 }
 
 async function getAvailableModels(
